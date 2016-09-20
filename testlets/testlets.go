@@ -1,3 +1,11 @@
+/*
+   ToDD task - set keyvalue pair in cache
+
+   Copyright 2016 Matt Oswalt. Use or modification of this
+   source code is governed by the license provided here:
+   https://github.com/Mierdin/todd/blob/master/LICENSE
+*/
+
 package testlets
 
 import (
@@ -9,21 +17,6 @@ import (
 
 	log "github.com/Sirupsen/logrus"
 )
-
-// NOTE
-//
-// Early efforts to build native-Go testlets involved the embedding of testlet logic into the
-// ToDD agent itself. As a result, it was important to build some reusable infrastructure so that goroutines
-// running testlet code inside the agent could be controlled, and that new testlets could benefit from this
-// infrastructure.
-//
-// Since then, the decision was made to keep testlets as their own separate binaries. Despite this, we can still benefit
-// from having them in Go because it is much more cross-platform than bash scripts.
-//
-// These testlets are in their own repositories, and they do actually use some of the logic below, just not as meaningfully
-// and comprehensively as they would have if they were baked in to the agent.  Those testlets will still vendor this code
-// and leverage the "Testlet" interface so that in the future, if we want to roll these into the todd-agent, those
-// testlets will already conform to the standard provided below.
 
 var (
 	testletsMu sync.RWMutex
@@ -69,11 +62,26 @@ type Testlet interface {
 	// without worrying about things like managing goroutines or channels. That's all
 	// managed by the "Run" or "Kill" functions
 	RunTestlet(string, []string, chan bool) (map[string]string, error)
-	// TODO(mierdin): is this really the best name for it? Maybe something that's less confusing, less like "Run"
 
 	// All testlets must be able to stop operation when sent a Kill command.
 	Kill() error
 }
+
+// NOTE
+//
+// Early efforts to build native-Go testlets involved the embedding of testlet logic into the
+// ToDD agent itself. As a result, it was important to build some reusable infrastructure so that goroutines
+// running testlet code within the agent could be controlled, and that new testlets could benefit from this
+// infrastructure.
+//
+// Since then, the decision was made to keep testlets as their own separate binaries.
+//
+// These testlets are in their own repositories, and they do actually use some of the logic below, just not as meaningfully
+// and comprehensively as they would have if they were baked in to the agent.  The development standard for all "blessed"
+// testlets will still ensure that they use this interface, so that if we decide to bake them into the agent in the future,
+// they'll already conform.
+//
+// (The vast majority of this code was inspired by the database drivers implementation in the stdlib)
 
 type rtfunc func(target string, args []string, kill chan bool) (map[string]string, error)
 
@@ -84,21 +92,27 @@ type BaseTestlet struct {
 	RunFunction rtfunc
 }
 
-// Run takes care of running the testlet function and managing it's operation given the parameters provided
+// Run is the interface between the specific testing logic and the orchestration code above.
+// It intentionally does not contain any testing-specific logic; such logic should be built inside
+// the "RunFunction" function of the testlet struct.
+// This function will handle some of the outside logic needed to make that testing happen asynchronously
+// so that testlet implementations need only to embed BaseTestlet and they get that functionality for free
 func (b BaseTestlet) Run(target string, args []string, timeLimit int) (map[string]string, error) {
 
 	var metrics map[string]string
 
-	// TODO(mierdin): ensure channel is nil
-	// done = make(chan error)
-	// kill = make(chan bool)
+	// Ensure control channels are empty
+	done := make(chan error)
+	kill := make(chan bool)
 
-	// TODO(mierdin): Based on experimentation, this will keep running even if this function returns.
-	// Need to be sure about how this ends. Also might want to evaluate the same for the existing
-	// non-native model, likely has the same issue
 	go func() {
-		theseMetrics, err := b.RunFunction(target, args, kill)
-		metrics = theseMetrics //TODO(mierdin): Gross.
+		metrics, err := b.RunFunction(target, args, kill)
+
+		// TODO(mierdin): avoiding a "declared and not used" error for now
+		// If this code is ever actually used, it should be modified to make "done"
+		// a channel that returns the metrics, so it's actually used (just an idea)
+		log.Error(metrics)
+
 		done <- err
 	}()
 
@@ -112,7 +126,7 @@ func (b BaseTestlet) Run(target string, args []string, timeLimit int) (map[strin
 
 	case err := <-done:
 		if err != nil {
-			return map[string]string{}, errors.New("testlet error") // TODO(mierdin): elaborate?
+			return map[string]string{}, errors.New("testlet error")
 		} else {
 			log.Debugf("Testlet <TESTLET> completed without error")
 			return metrics, nil
@@ -120,13 +134,10 @@ func (b BaseTestlet) Run(target string, args []string, timeLimit int) (map[strin
 	}
 }
 
+// Kill is currently unimplemented. This will have to be coordinated with "Run". Basically
+// you need a way to kill this testlet (and that's really only possible when running
+// async) Probably just want to set the channel to something so the select within "Run" will execute
 func (b BaseTestlet) Kill() error {
-	// TODO (mierdin): This will have to be coordinated with the task above. Basically
-	// you need a way to kill this testlet (and that's really only possible when running
-	// async)
-
-	// Probably just want to set the channel  to something so the select within "Run" will execute
-
 	return nil
 }
 
@@ -144,9 +155,6 @@ func IsNativeTestlet(name string) (bool, string) {
 func NewTestlet(name string) (Testlet, error) {
 
 	if testlet, ok := testlets[name]; ok {
-
-		// testlet.runFunction = testlet.run
-
 		return testlet, nil
 	} else {
 		return nil, errors.New(
@@ -158,6 +166,27 @@ func NewTestlet(name string) (Testlet, error) {
 // Register makes a testlet available by the provided name.
 // If Register is called twice with the same name or if testlet is nil,
 // it will return an error
+//
+// =======
+// EXAMPLE
+// =======
+// // PingTestlet is one example that satisfies interface Testlet
+// var pt = ping.PingTestlet{}
+
+// // Ensure the RunFunction attribute is set correctly.
+// // This allows the underlying testlet infrastructure
+// // to know what function to call at runtime
+// pt.RunFunction = pt.RunTestlet
+
+// // This is important - register the name of this testlet
+// // (the name the user will use in a testrun definition)
+// //testlets.Register("ping", &pt)
+//
+// =======
+//
+// TODO(mierdin): This is no longer used now that testlets are separate binaries,
+// but one idea for the future could be that this function could register to the
+//todd-agent via IPC of some kind, so that nativeTestlets is no longer needed
 func Register(name string, testlet Testlet) error {
 	testletsMu.Lock()
 	defer testletsMu.Unlock()
